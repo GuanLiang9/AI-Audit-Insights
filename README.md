@@ -11,9 +11,19 @@ areas, most-affected agencies, an executive summary, and a cited Q&A chat.
 
 ---
 
-## The core idea
+## Solution Approach
 
-There are two different kinds of questions, and using one tool for both is the classic mistake:
+**The problem.** An auditor has many long audit reports and needs insight *across* the whole set —
+recurring control themes, common weaknesses, most-affected agencies — not a summary of any single
+report. That word "across" is the crux: the value is in aggregating over the corpus.
+
+**The decomposition.** I split the problem into five independent stages:
+**ingest** (PDF → text → chunks) → **understand** (LLM extracts structured findings) →
+**store** (SQLite + vector index) → **aggregate** (count patterns across reports) →
+**present** (dashboard + Q&A). Each stage is swappable without touching the others.
+
+**The core idea.** There are two different kinds of questions, and using one tool for both is the
+classic mistake:
 
 | Question | Approach | Why |
 |---|---|---|
@@ -42,6 +52,37 @@ because top-k retrieval only ever sees a handful of chunks.
 
 ---
 
+## AI Approach
+
+The design principle is **use the LLM only where it is uniquely strong, and use code where code is
+better.** Three distinct AI roles:
+
+1. **Structured extraction (LLM).** Each report's full text is sent to the LLM in
+   **JSON/schema-constrained mode** (Gemini `response_schema`); the output is validated against a
+   Pydantic model (`backend/app/models/findings.py`). Each finding is mapped onto a **fixed
+   taxonomy** — `theme`, `risk_area`, `severity` are enums — so the same concept is always labelled
+   the same way. This is what makes the findings *countable*.
+2. **Deterministic aggregation (code, no LLM).** Recurring themes, severity mix, most-affected
+   agencies, and "recurs across N reports" are plain group-by counts in
+   `backend/app/insights/aggregate.py` — exact and reproducible. Counting is not an LLM job.
+3. **Retrieval-Augmented Generation (LLM + vectors).** For open-ended questions, the query is
+   embedded with the same local MiniLM model, ChromaDB returns the top-k nearest chunks, and the
+   LLM answers **using only that context, with `[n]` citations** (`backend/app/qa/rag.py`).
+
+The **executive summary** (`backend/app/insights/summary.py`) is an LLM *synthesis* of the
+already-computed numbers plus a grounded sample of high-severity findings — narrative, not counting.
+
+**Reliability / anti-hallucination:** schema-constrained decoding guarantees valid, on-taxonomy
+output; system prompts instruct the model to extract only what the text supports; the Q&A path is
+restricted to retrieved context and forced to cite sources.
+
+**Model & abstraction:** Gemini 2.5 Flash (free tier, long context, native JSON mode) sits behind
+an `LLMProvider` interface (`backend/app/llm/`) exposing `generate` and `generate_structured`, so
+switching vendor is a one-file change. Internal "thinking" is disabled for structured calls to keep
+the full token budget for the JSON output.
+
+---
+
 ## Architecture
 
 ```
@@ -61,7 +102,7 @@ FastAPI
 
 ---
 
-## Tech stack & why
+## Technology Stack
 
 | Concern | Choice | Why |
 |---|---|---|
@@ -72,6 +113,18 @@ FastAPI
 | Vector DB | **ChromaDB** | zero-infra persistent vector store |
 | Structured store | **SQLite** | exact aggregation, zero setup |
 | LLM | **Gemini 2.5 Flash** (swappable) | free tier, long context, native JSON mode |
+
+---
+
+## Assumptions
+
+- Input PDFs contain a real text layer (not scanned images) and are in English.
+- Reports are AGO-style government audit reports; the finding taxonomy is tuned to that domain.
+- The most significant ~25 findings per report are sufficient for insight (extraction cap).
+- A whole report fits the model's context window; input is capped at ~200k characters as a guard.
+- Single-user, single-node, local/demo scope — authentication is out of scope for this exercise.
+- Outbound access to the Gemini API is available and free-tier latency/limits are acceptable.
+- Agency/system names are taken as written in the reports (no external entity resolution).
 
 ---
 
@@ -136,6 +189,25 @@ backend/app/
 frontend/src/         React app (Reports / Insights / Q&A)
 materials/            sample audit reports
 ```
+
+---
+
+## Challenges Encountered
+
+- **Pure RAG can't aggregate.** Early on, a RAG-for-everything approach couldn't answer
+  "how often across all reports" — top-k retrieval only sees a handful of chunks. This drove the
+  headline decision: structured extraction + code aggregation for counts, RAG for lookups.
+- **Consistent categories for counting.** Free-text themes don't aggregate ("Access Control" vs
+  "IAM"). Solved with a fixed enum taxonomy enforced by schema-constrained LLM output.
+- **Model availability.** `gemini-1.5-flash` returned `404 NOT_FOUND` (retired); I listed the
+  models available to the key via the API and switched to `gemini-2.5-flash`.
+- **Thinking-model truncation.** 2.5-flash is a reasoning model — its internal "thinking" consumed
+  the output-token budget and truncated the JSON. Fixed by disabling thinking (`thinking_budget=0`)
+  and raising `max_output_tokens` for structured calls.
+- **Deprecated SDK.** Migrated from the deprecated `google-generativeai` package to the current
+  unified `google-genai` SDK.
+- **Charts blank in captured screenshots.** Recharts' entry animation left bars empty in headless
+  captures; disabling animation fixed the screenshots and made the dashboard render instantly.
 
 ---
 
